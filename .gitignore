@@ -205,3 +205,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Lexifyd project
+*.db
+*.db-journal
+backend/logs/
+frontend/dist/
+frontend/node_modules/
+frontend/.vite/
+.env.local
+indic_nlp_resources/
