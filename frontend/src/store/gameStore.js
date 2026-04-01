@@ -15,7 +15,6 @@ const useGameStore = create(
       scoreAnimations: {},
       score: 0,
       streak: 0,
-      correctCount: 0,
       hearts: 3,
       feedback: null,        // null | { isCorrect, correctAnswer, scoreDelta, message }
       feedbackLocked: false,
@@ -55,7 +54,6 @@ const useGameStore = create(
           scoreAnimations: {},
           score: 0,
           streak: 0,
-          correctCount: 0,
           hearts: 3,
           feedback: null,
           feedbackLocked: false,
@@ -94,7 +92,6 @@ const useGameStore = create(
           scoreAnimations: { ...scoreAnimations, [questionIndex]: delta },
           score: response.total_score,
           streak: response.streak,
-          correctCount: response.is_correct ? get().correctCount + 1 : get().correctCount,
           hearts: newHearts,
           feedback: {
             isCorrect: response.is_correct,
@@ -219,7 +216,6 @@ const useGameStore = create(
           scoreAnimations: {},
           score: 0,
           streak: 0,
-          correctCount: 0,
           hearts: 3,
           feedback: null,
           feedbackLocked: false,

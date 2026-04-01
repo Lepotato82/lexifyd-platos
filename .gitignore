@@ -3,7 +3,6 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-backend/data/
 
 # C extensions
 *.so
@@ -217,3 +216,18 @@ frontend/node_modules/
 frontend/.vite/
 .env.local
 indic_nlp_resources/
+
+# Local editor / AI tooling (do not publish)
+.claude/
+
+# Large corpus + generated dataset artifacts (curated lexifyd_dataset.json stays tracked)
+backend/data/tamil_wiki/
+backend/data/lexifyd_dataset_generated_failed.json
+backend/data/.dataset_build_checkpoint.json
+backend/data/failed_dataset.json
+backend/data/oldlexifyd_dataset.json
+
+# Legacy doc filenames (superseded by README.md)
+CLAUDE.md
+DOCUMENTATION.md
+

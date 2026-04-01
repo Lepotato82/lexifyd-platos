@@ -94,6 +94,15 @@ def _validate_distractors(
     return valid
 
 
+def filter_inflection_distractors(
+    distractors: list[str],
+    correct_answer: str,
+    word_ta: str,
+) -> list[str]:
+    """Public wrapper — same rules as dynamic gameplay distractors (root-prefix forms)."""
+    return _validate_distractors(list(distractors), correct_answer, word_ta)
+
+
 def generate_distractors(
     sentence: str,
     correct_answer: str,

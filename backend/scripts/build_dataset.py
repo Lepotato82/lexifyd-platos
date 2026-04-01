@@ -3,23 +3,37 @@ Automated dataset builder — reads Tamil Wikipedia, generates game entries via
 Groq LLM, validates them, and writes to a NEW file (does NOT overwrite the
 curated lexifyd_dataset.json).
 
-Demonstrates the full pipeline:
+Pipeline:
   Tamil Wikipedia raw text
     → Phase 1: sentence extraction
-    → Phase 2: LLM question generation (Groq llama-3.3-70b-versatile)
-    → Phase 3: structural validation
-    → data/lexifyd_dataset_generated.json
+    → Phase 2: LLM question generation (Groq llama-3.3-70b-versatile) + retries
+    → Phase 3: NFC normalization, deterministic blanks, distractor rules,
+               optional IndicBERT gate, dedupe, failed-entry log
+    → data/lexifyd_dataset_generated.json (+ optional checkpoint / failures)
 
 Run from the backend/ directory:
     python scripts/build_dataset.py
+    python scripts/build_dataset.py --fresh
+    python scripts/build_dataset.py --relaxed-distractors
+    python scripts/build_dataset.py --indicbert
+
+Env:
+    GROQ_API_KEY           — required
+    GROQ_SLEEP_SECONDS     — pause between words (default 90)
+    DATASET_BUILD_USE_INDICBERT — set to 1 to enable IndicBERT gate (slow; large model)
+    DATASET_BUILD_RELAXED_DISTRACTORS — 1 = allow non-inflection distractors if Tamil
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import logging
 import os
 import re
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 
@@ -28,10 +42,14 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 
 from dotenv import load_dotenv
+
 load_dotenv(BACKEND_DIR / ".env")
 
-# Output goes to a SEPARATE file — curated dataset is never touched
-OUTPUT_PATH  = BACKEND_DIR / "data" / "lexifyd_dataset_generated.json"
+from services.llm_distractors import filter_inflection_distractors
+
+OUTPUT_PATH = BACKEND_DIR / "data" / "lexifyd_dataset_generated.json"
+FAILED_PATH = BACKEND_DIR / "data" / "lexifyd_dataset_generated_failed.json"
+CHECKPOINT_PATH = BACKEND_DIR / "data" / ".dataset_build_checkpoint.json"
 RAW_FILES_DIR = BACKEND_DIR / "data" / "tamil_wiki" / "raw_text_files"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -41,13 +59,14 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ── Regex helpers ─────────────────────────────────────────────────────────────
-TAMIL_RE      = re.compile(r"[\u0B80-\u0BFF]")
+TAMIL_RE = re.compile(r"[\u0B80-\u0BFF]")
 SKIP_START_RE = re.compile(r"^\s*(<doc|</doc|\{\{|==|\*|#|\[|:|;)")
 HTML_ENTITY_RE = re.compile(r"&lt;|&gt;|&quot;|&amp;|&#160;")
-BRACKET_RE    = re.compile(r"\[\[.*?\]\]|\{\{.*?\}\}|<[^>]+>")
+BRACKET_RE = re.compile(r"\[\[.*?\]\]|\{\{.*?\}\}|<[^>]+>")
 
 # ── Polysemous word definitions ───────────────────────────────────────────────
 POLYSEMOUS_WORDS = [
@@ -108,7 +127,7 @@ POLYSEMOUS_WORDS = [
     {
         "word_ta": "விழி",
         "romanized": "Vizhi",
-        "search_forms": ["விழி", "விழியில்", "விழியை", "விழுந்த", "விழுந்து"],
+        "search_forms": ["விழி", "விழியில்", "விழியை", "விழிகள்"],
         "senses": ["eye", "to fall"],
     },
 ]
@@ -134,8 +153,9 @@ CRITICAL RULES:
 - Only include sentences where the sense is 100% clear from context
 - Skip sentences where the sense is ambiguous
 - correct_answer must be the EXACT form as it appears in the sentence
-- All distractors must derive from {word_ta} only
+- All distractors must derive from {word_ta} only (must start with the characters of {word_ta})
 - Return at most 4 entries total
+- original_sentence must be copied verbatim from the list above (no invention)
 
 Return a JSON array. For each valid sentence:
 {{
@@ -157,6 +177,23 @@ Return ONLY the JSON array, no markdown, no explanation.\
 """
 
 
+# ── Unicode / text ────────────────────────────────────────────────────────────
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s) if s else s
+
+
+def _canonical_game_sentence(original: str, correct: str) -> str | None:
+    """Replace first occurrence of correct with ______ (single blank)."""
+    if not original or not correct:
+        return None
+    o, c = _nfc(original), _nfc(correct)
+    idx = o.find(c)
+    if idx < 0:
+        return None
+    return o[:idx] + "______" + o[idx + len(c) :]
+
+
 # ── Phase 1: extract sentences from Wikipedia files ───────────────────────────
 
 def _clean_line(line: str) -> str:
@@ -170,7 +207,7 @@ def _clean_line(line: str) -> str:
     total = len(line.replace(" ", ""))
     if total == 0:
         return ""
-    english = sum(1 for c in line if c.isascii() and c.isalpha())
+    english = sum(1 for ch in line if ch.isascii() and ch.isalpha())
     if english / total > 0.40:
         return ""
     if len(line.split()) < 5:
@@ -190,24 +227,24 @@ def _extract_sentences(text: str) -> list[str]:
 
 def phase1_collect(max_per_word: int = 8) -> dict[str, list[str]]:
     """Walk wiki files, collect up to max_per_word sentences per target word."""
+    if not RAW_FILES_DIR.is_dir():
+        logger.warning("Wikipedia directory missing: %s — Phase 1 will return empty.", RAW_FILES_DIR)
+        return {wd["word_ta"]: [] for wd in POLYSEMOUS_WORDS}
+
     txt_files = list(RAW_FILES_DIR.rglob("*.txt"))
-    logger.info(f"Phase 1 — scanning {len(txt_files)} Wikipedia files …")
+    logger.info("Phase 1 — scanning %s Wikipedia files …", len(txt_files))
 
     word_sentences: dict[str, list[str]] = defaultdict(list)
 
     for path in txt_files:
-        # Stop early if all words already have enough sentences
-        if all(len(word_sentences[wd["word_ta"]]) >= max_per_word
-               for wd in POLYSEMOUS_WORDS):
+        if all(len(word_sentences[wd["word_ta"]]) >= max_per_word for wd in POLYSEMOUS_WORDS):
             break
         try:
             raw = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
+        except OSError:
             continue
 
-        cleaned = " ".join(
-            ln for ln in (_clean_line(l) for l in raw.splitlines()) if ln
-        )
+        cleaned = " ".join(ln for ln in (_clean_line(l) for l in raw.splitlines()) if ln)
         sentences = _extract_sentences(cleaned)
 
         for word_def in POLYSEMOUS_WORDS:
@@ -226,16 +263,48 @@ def phase1_collect(max_per_word: int = 8) -> dict[str, list[str]]:
     logger.info("Phase 1 done:")
     for wd in POLYSEMOUS_WORDS:
         wt = wd["word_ta"]
-        logger.info(f"  {wt} ({wd['romanized']}): {len(word_sentences[wt])} sentences")
+        logger.info("  %s (%s): %s sentences", wt, wd["romanized"], len(word_sentences[wt]))
 
     return dict(word_sentences)
 
 
-# ── Phase 2: generate questions via Groq ──────────────────────────────────────
+# ── Phase 2: Groq + JSON ─────────────────────────────────────────────────────
 
-def _call_groq(prompt: str, api_key: str) -> list[dict]:
-    """Call Groq API synchronously, parse JSON array from response."""
+def _parse_llm_json_array(raw: str) -> list:
+    """Parse JSON array from model output; tolerate fences and trailing junk."""
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```\s*$", "", text)
+
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in ("entries", "items", "data", "questions"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+            return [data]
+        if isinstance(data, list):
+            return data
+        raise ValueError("root must be array or object with list")
+    except json.JSONDecodeError:
+        pass
+
+    start, end = text.find("["), text.rfind("]")
+    if start != -1 and end > start:
+        chunk = text[start : end + 1]
+        try:
+            data = json.loads(chunk)
+            if isinstance(data, list):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError("LLM returned invalid JSON (could not parse array)")
+
+
+def _call_groq_once(prompt: str, api_key: str) -> str:
     from groq import Groq
+
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -243,31 +312,78 @@ def _call_groq(prompt: str, api_key: str) -> list[dict]:
         temperature=0.3,
         max_tokens=2048,
     )
-    raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if present
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+    return response.choices[0].message.content.strip()
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "429" in msg or "rate limit" in msg or "too many requests" in msg
+
+
+def call_groq_for_word(prompt: str, api_key: str, max_retries: int = 8) -> list:
+    """Call Groq with exponential backoff on rate limits; return parsed list of dicts."""
+    last: BaseException | None = None
+    for attempt in range(max_retries):
+        try:
+            raw = _call_groq_once(prompt, api_key)
+            return _parse_llm_json_array(raw)
+        except Exception as exc:
+            last = exc
+            if _is_rate_limit_error(exc):
+                wait = min(180, int(10 * (2**attempt)))
+                logger.warning("Groq rate limit / transient error (attempt %s/%s), sleeping %ss: %s",
+                               attempt + 1, max_retries, wait, exc)
+                time.sleep(wait)
+            else:
+                logger.error("Groq / JSON error (attempt %s/%s): %s", attempt + 1, max_retries, exc)
+                if attempt < max_retries - 1:
+                    time.sleep(min(60, 5 * (attempt + 1)))
+                else:
+                    raise
+    assert last is not None
+    raise last
+
+
+def load_checkpoint() -> dict:
+    if not CHECKPOINT_PATH.is_file():
+        return {}
+    try:
+        return json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_checkpoint(data: dict) -> None:
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def phase2_generate(
     word_sentences: dict[str, list[str]],
     api_key: str,
+    *,
+    fresh: bool,
+    sleep_seconds: float,
 ) -> list[dict]:
-    """For each word with collected sentences, call the LLM to generate entries."""
+    """For each word with collected sentences, call the LLM (or resume checkpoint)."""
     master: list[dict] = []
+    words_with_data = [wd for wd in POLYSEMOUS_WORDS if word_sentences.get(wd["word_ta"])]
 
-    words_with_data = [
-        wd for wd in POLYSEMOUS_WORDS
-        if word_sentences.get(wd["word_ta"])
-    ]
-    logger.info(f"Phase 2 — generating entries for {len(words_with_data)} words via Groq …")
+    cp = {} if fresh else load_checkpoint()
+    by_word: dict[str, list] = dict(cp.get("by_word") or {})
+
+    logger.info("Phase 2 — generating entries for %s words via Groq …", len(words_with_data))
 
     for idx, word_def in enumerate(words_with_data):
-        wt       = word_def["word_ta"]
+        wt = word_def["word_ta"]
         sentences = word_sentences[wt]
 
-        sentences_block = "\n".join(f"{i+1}. {s}" for i, s in enumerate(sentences))
+        if wt in by_word and not fresh:
+            master.extend(by_word[wt])
+            logger.info("  [%s/%s] %s — using checkpoint (%s entries)", idx + 1, len(words_with_data), wt, len(by_word[wt]))
+            continue
+
+        sentences_block = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
         prompt = GENERATION_PROMPT.format(
             word_ta=wt,
             romanized=word_def["romanized"],
@@ -275,67 +391,193 @@ def phase2_generate(
             sentences_list=sentences_block,
         )
 
-        logger.info(f"  [{idx+1}/{len(words_with_data)}] {wt} — calling LLM …")
+        logger.info("  [%s/%s] %s — calling LLM …", idx + 1, len(words_with_data), wt)
         try:
-            entries = _call_groq(prompt, api_key)
-            if isinstance(entries, list):
-                master.extend(entries)
-                logger.info(f"    → {len(entries)} entries returned")
-            else:
-                logger.warning(f"    → unexpected response type: {type(entries)}")
+            entries = call_groq_for_word(prompt, api_key)
+            if not isinstance(entries, list):
+                logger.warning("    → unexpected response type: %s", type(entries))
+                entries = []
+            dict_entries = [e for e in entries if isinstance(e, dict)]
+            by_word[wt] = dict_entries
+            save_checkpoint({"by_word": by_word})
+            master.extend(dict_entries)
+            logger.info("    → %s entries returned", len(dict_entries))
         except Exception as exc:
-            logger.error(f"    → LLM call failed: {exc}")
+            logger.error("    → LLM failed for %s: %s", wt, exc)
 
-        # Respect Groq free-tier rate limits between words (not after the last one)
-        if idx < len(words_with_data) - 1:
-            logger.info("    (pausing 90 s for Groq rate limit…)")
-            time.sleep(90)
+        if idx < len(words_with_data) - 1 and sleep_seconds > 0:
+            logger.info("    (pausing %s s for Groq rate limit…)", sleep_seconds)
+            time.sleep(sleep_seconds)
 
     return master
 
 
-# ── Phase 3: validate and save to new file ────────────────────────────────────
+# ── Phase 3: validate, optional IndicBERT, save ─────────────────────────────
 
-def _validate(entry: dict) -> tuple[bool, str]:
-    game     = entry.get("game_sentence", "")
-    original = entry.get("original_sentence", "")
-    correct  = entry.get("correct_answer", "")
-    dists    = entry.get("distractors", [])
-
-    if game.count("______") != 1:
-        return False, f"game_sentence has {game.count('______')} blanks (expected 1)"
-    if not correct:
-        return False, "empty correct_answer"
-    if correct not in original:
-        return False, f"'{correct}' not found in original_sentence"
-    if len(dists) != 3:
-        return False, f"{len(dists)} distractors (expected 3)"
-    if correct in dists:
-        return False, "correct_answer duplicated in distractors"
+def _relaxed_distractors_ok(distractors: list[str], correct: str) -> tuple[bool, str]:
+    if len(distractors) != 3:
+        return False, f"{len(distractors)} distractors (expected 3)"
+    seen = set()
+    for d in distractors:
+        d = _nfc((d or "").strip())
+        if not d:
+            return False, "empty distractor"
+        if not TAMIL_RE.search(d):
+            return False, f"distractor has no Tamil script: {d!r}"
+        if len(d) > 48:
+            return False, "distractor too long"
+        if d == _nfc(correct.strip()):
+            return False, "distractor equals correct_answer"
+        if d in seen:
+            return False, "duplicate distractor"
+        seen.add(d)
     return True, ""
 
 
-def phase3_save(master: list[dict]) -> list[dict]:
+def _indicbert_gate(entry: dict) -> tuple[bool, str]:
+    """When the blank scores are meaningful, require correct > distractors."""
+    try:
+        from services.indic_bert import score_distractors as bert_score
+    except Exception as exc:
+        logger.debug("IndicBERT skip (import): %s", exc)
+        return True, ""
+
+    try:
+        rows = bert_score(
+            entry["game_sentence"],
+            entry["correct_answer"],
+            entry["distractors"],
+        )
+        correct_row = bert_score(
+            entry["game_sentence"],
+            entry["correct_answer"],
+            [entry["correct_answer"]],
+        )
+    except Exception as exc:
+        logger.warning("IndicBERT scoring failed (entry kept): %s", exc)
+        return True, ""
+
+    cs = correct_row[0].get("score", 0.0) if correct_row else 0.0
+    max_d = max((r.get("score", 0.0) for r in rows), default=0.0)
+
+    # If the MLM didn't surface the gold token, scores are unreliable — do not reject.
+    if cs <= 0:
+        return True, ""
+
+    if max_d >= cs:
+        return False, "IndicBERT: a distractor scores >= correct answer at blank"
+
+    good = sum(1 for r in rows if r.get("is_good_distractor"))
+    if good < 1:
+        return False, "IndicBERT: no distractor flagged as weaker fit than correct"
+
+    return True, ""
+
+
+def validate_and_normalize_entry(
+    entry: dict,
+    *,
+    relaxed_distractors: bool,
+    use_indicbert: bool,
+) -> tuple[bool, str, dict | None]:
+    """
+    Returns (ok, reason, normalized_entry_or_none).
+    On success, normalized_entry has canonical game_sentence and NFC text fields.
+    """
+    word_ta = _nfc((entry.get("word_ta") or "").strip())
+    original = _nfc((entry.get("original_sentence") or "").strip())
+    correct = _nfc((entry.get("correct_answer") or "").strip())
+    dists_raw = entry.get("distractors") or []
+
+    if not isinstance(dists_raw, list):
+        return False, "distractors must be a list", None
+    dists = [_nfc(str(d).strip()) for d in dists_raw if str(d).strip()]
+
+    if not word_ta:
+        return False, "missing word_ta", None
+    if not correct:
+        return False, "empty correct_answer", None
+    if correct not in original:
+        return False, f"{correct!r} not found in original_sentence", None
+
+    canonical = _canonical_game_sentence(original, correct)
+    if canonical is None or canonical.count("______") != 1:
+        return False, "could not build single-blank game_sentence", None
+
+    if len(dists) != 3:
+        return False, f"{len(dists)} distractors (expected 3)", None
+    if correct in dists:
+        return False, "correct_answer duplicated in distractors", None
+
+    if relaxed_distractors:
+        ok_r, reason_r = _relaxed_distractors_ok(dists, correct)
+        if not ok_r:
+            return False, reason_r, None
+    else:
+        filtered = filter_inflection_distractors(dists, correct, word_ta)
+        if len(filtered) != 3:
+            return False, "distractors must be 3 distinct inflected forms of root (prefix match)", None
+
+    out = dict(entry)
+    out["word_ta"] = word_ta
+    out["original_sentence"] = original
+    out["correct_answer"] = correct
+    out["distractors"] = dists
+    out["game_sentence"] = canonical
+
+    if use_indicbert:
+        ok_b, reason_b = _indicbert_gate(out)
+        if not ok_b:
+            return False, reason_b, None
+
+    return True, "", out
+
+
+def phase3_save(
+    master: list[dict],
+    *,
+    relaxed_distractors: bool,
+    use_indicbert: bool,
+) -> list[dict]:
     valid: list[dict] = []
+    failed: list[dict] = []
     failures: dict[str, int] = {}
+    seen_keys: set[tuple[str, str]] = set()
 
     for entry in master:
-        ok, reason = _validate(entry)
-        if ok:
-            valid.append(entry)
-        else:
-            failures[reason] = failures.get(reason, 0) + 1
+        if not isinstance(entry, dict):
+            failures["not_a_dict"] = failures.get("not_a_dict", 0) + 1
+            failed.append({"entry": entry, "reason": "not_a_dict"})
+            continue
 
-    logger.info(
-        f"Phase 3 — validation: {len(valid)}/{len(master)} entries passed"
-    )
+        ok, reason, normalized = validate_and_normalize_entry(
+            entry,
+            relaxed_distractors=relaxed_distractors,
+            use_indicbert=use_indicbert,
+        )
+        if not ok:
+            failures[reason] = failures.get(reason, 0) + 1
+            failed.append({"entry": entry, "reason": reason})
+            continue
+
+        assert normalized is not None
+        key = (normalized["original_sentence"], normalized["correct_answer"])
+        if key in seen_keys:
+            failures["duplicate_sentence+answer"] = failures.get("duplicate_sentence+answer", 0) + 1
+            failed.append({"entry": entry, "reason": "duplicate_sentence+answer"})
+            continue
+        seen_keys.add(key)
+        valid.append(normalized)
+
+    logger.info("Phase 3 — validation: %s/%s entries passed", len(valid), len(master))
     if failures:
         for reason, count in sorted(failures.items(), key=lambda x: -x[1]):
-            logger.info(f"  [{count}x] {reason}")
+            logger.info("  [%sx] %s", count, reason)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as fh:
-        json.dump(valid, fh, ensure_ascii=False, indent=2)
+    OUTPUT_PATH.write_text(json.dumps(valid, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    FAILED_PATH.write_text(json.dumps(failed, ensure_ascii=False, indent=2), encoding="utf-8")
 
     per_word: dict[str, int] = defaultdict(int)
     for e in valid:
@@ -344,40 +586,64 @@ def phase3_save(master: list[dict]) -> list[dict]:
     print("\n" + "=" * 60)
     print("  DATASET BUILD COMPLETE")
     print("=" * 60)
-    print(f"  Wikipedia sentences processed : {len(master)}")
-    print(f"  Valid entries generated        : {len(valid)}")
-    print(f"  Output file                   : {OUTPUT_PATH.name}")
+    print(f"  Raw LLM rows processed     : {len(master)}")
+    print(f"  Valid entries written      : {len(valid)}")
+    print(f"  Failed (with reasons)      : {len(failed)} → {FAILED_PATH.name}")
+    print(f"  Output file                : {OUTPUT_PATH.name}")
     print("  Entries per word:")
     for wt, cnt in sorted(per_word.items()):
         print(f"    {wt}: {cnt}")
     print("=" * 60)
-    print(f"\n  NOTE: curated lexifyd_dataset.json was NOT modified.")
-    print(f"  Inspect {OUTPUT_PATH} to review the generated entries.\n")
+    print("\n  NOTE: curated lexifyd_dataset.json was NOT modified.")
+    print(f"  Inspect {OUTPUT_PATH} and triage {FAILED_PATH.name} as needed.\n")
 
     return valid
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build lexifyd_dataset_generated.json from Tamil Wikipedia + Groq")
+    parser.add_argument("--fresh", action="store_true", help="Ignore checkpoint and re-call LLM for every word")
+    parser.add_argument(
+        "--relaxed-distractors",
+        action="store_true",
+        help="Allow any Tamil distractors (matches some curated JSON styles; weaker for morphology)",
+    )
+    parser.add_argument("--indicbert", action="store_true", help="Run IndicBERT fill-mask gate (slow, downloads ~1GB model on first use)")
+    args = parser.parse_args()
+
+    relaxed = args.relaxed_distractors or os.getenv("DATASET_BUILD_RELAXED_DISTRACTORS", "").strip() in ("1", "true", "yes")
+    use_indicbert = args.indicbert or os.getenv("DATASET_BUILD_USE_INDICBERT", "").strip() in ("1", "true", "yes")
+
     api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
         logger.error("GROQ_API_KEY not set — add it to backend/.env")
         sys.exit(1)
 
     try:
-        from groq import Groq  # noqa: F401 — just check it's installed
+        from groq import Groq  # noqa: F401
     except ImportError:
         logger.error("groq package missing — run: pip install groq")
         sys.exit(1)
 
+    sleep_seconds = float(os.getenv("GROQ_SLEEP_SECONDS", "90"))
+
     logger.info("Starting Lexifyd dataset build pipeline")
-    logger.info(f"  Wikipedia source: {RAW_FILES_DIR}")
-    logger.info(f"  Output target   : {OUTPUT_PATH}")
+    logger.info("  Wikipedia source : %s", RAW_FILES_DIR)
+    logger.info("  Output target    : %s", OUTPUT_PATH)
+    logger.info("  Checkpoint       : %s (--fresh to reset)", CHECKPOINT_PATH)
+    logger.info("  Relaxed distractors: %s", relaxed)
+    logger.info("  IndicBERT gate   : %s", use_indicbert)
 
     word_sentences = phase1_collect(max_per_word=8)
-    master         = phase2_generate(word_sentences, api_key)
-    phase3_save(master)
+    master = phase2_generate(
+        word_sentences,
+        api_key,
+        fresh=args.fresh,
+        sleep_seconds=sleep_seconds,
+    )
+    phase3_save(master, relaxed_distractors=relaxed, use_indicbert=use_indicbert)
 
 
 if __name__ == "__main__":

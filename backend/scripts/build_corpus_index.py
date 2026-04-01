@@ -1,6 +1,8 @@
 """
 One-time script to index Tamil Wikipedia articles into corpus.db for FTS5 search.
 
+Not used by the FastAPI app — optional tool for local search experiments only.
+
 Run from the backend/ directory:
     python scripts/build_corpus_index.py
 
