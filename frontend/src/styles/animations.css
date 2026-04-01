@@ -1,0 +1,135 @@
+@keyframes floatUp {
+  0%   { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-48px) scale(1.2); }
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%       { transform: translateX(-4px); }
+  40%       { transform: translateX(4px); }
+  60%       { transform: translateX(-4px); }
+  80%       { transform: translateX(4px); }
+}
+
+@keyframes popIn {
+  0%   { transform: scale(0.6); opacity: 0; }
+  60%  { transform: scale(1.12); }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+@keyframes countUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes scoreUp {
+  0%   { transform: translateY(0) scale(1); opacity: 1; }
+  50%  { transform: translateY(-20px) scale(1.3); }
+  100% { transform: translateY(-45px) scale(0.9); opacity: 0; }
+}
+
+@keyframes slideUp {
+  0%   { transform: translateY(100%); opacity: 0; }
+  100% { transform: translateY(0);    opacity: 1; }
+}
+
+@keyframes heartLost {
+  0%   { transform: scale(1); filter: brightness(1); }
+  25%  { transform: scale(1.5); filter: brightness(2); }
+  50%  { transform: scale(0.6); filter: brightness(0.5); }
+  100% { transform: scale(1); filter: brightness(1); }
+}
+
+@keyframes confettiFall {
+  0%   { transform: translateY(-20px) rotate(0deg);   opacity: 1; }
+  100% { transform: translateY(110vh) rotate(720deg); opacity: 0; }
+}
+
+@keyframes starBounce {
+  0%   { transform: scale(0) rotate(-30deg); opacity: 0; }
+  60%  { transform: scale(1.4) rotate(5deg); opacity: 1; }
+  80%  { transform: scale(0.9) rotate(-2deg); }
+  100% { transform: scale(1) rotate(0deg);   opacity: 1; }
+}
+
+/* ── Retro-specific animations ────────────────────────────────────────────── */
+
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 5px var(--primary-glow); }
+  50%      { box-shadow: 0 0 20px var(--primary-glow), 0 0 40px rgba(124, 106, 247, 0.1); }
+}
+
+@keyframes neonFlicker {
+  0%, 100% { opacity: 1; }
+  92%      { opacity: 1; }
+  93%      { opacity: 0.8; }
+  94%      { opacity: 1; }
+  96%      { opacity: 0.9; }
+  97%      { opacity: 1; }
+}
+
+@keyframes pixelBounce {
+  0%, 100% { transform: translateY(0); }
+  25%      { transform: translateY(-3px); }
+  75%      { transform: translateY(1px); }
+}
+
+@keyframes correctFlash {
+  0%   { background: rgba(57, 255, 20, 0.3); box-shadow: 0 0 20px rgba(57, 255, 20, 0.5); }
+  100% { background: rgba(57, 255, 20, 0.08); box-shadow: none; }
+}
+
+@keyframes wrongShake {
+  0%, 100% { transform: translateX(0); }
+  10%      { transform: translateX(-6px); }
+  20%      { transform: translateX(6px); }
+  30%      { transform: translateX(-6px); }
+  40%      { transform: translateX(6px); }
+  50%      { transform: translateX(-3px); }
+  60%      { transform: translateX(3px); }
+}
+
+@keyframes levelUp {
+  0%   { transform: scale(1); filter: brightness(1); }
+  30%  { transform: scale(1.15); filter: brightness(1.5); }
+  60%  { transform: scale(0.95); }
+  100% { transform: scale(1); filter: brightness(1); }
+}
+
+@keyframes scanline {
+  0%   { top: -100%; }
+  100% { top: 100%; }
+}
+
+@keyframes mascotBounce {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  30%      { transform: translateY(-12px) rotate(-3deg); }
+  60%      { transform: translateY(-6px) rotate(2deg); }
+}
+
+@keyframes mascotSad {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50%      { transform: translateY(3px) rotate(-2deg); }
+}
+
+.animate-popIn         { animation: popIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
+.animate-countUp       { animation: countUp 0.4s ease-out forwards; }
+.animate-scoreUp       { animation: scoreUp 0.8s ease-out forwards; }
+.animate-slideUp       { animation: slideUp 0.3s cubic-bezier(0.32, 0.72, 0, 1); }
+.animate-heartLost     { animation: heartLost 0.5s ease-out; }
+.animate-starBounce    { animation: starBounce 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
+.animate-confettiFall  { animation: confettiFall var(--duration, 2s) ease-in forwards; }
+.animate-pulse-soft    { animation: pulse-soft 1.5s ease-in-out infinite; }
+.animate-glowPulse     { animation: glowPulse 2s ease-in-out infinite; }
+.animate-neonFlicker   { animation: neonFlicker 3s ease-in-out infinite; }
+.animate-pixelBounce   { animation: pixelBounce 0.6s ease-in-out; }
+.animate-correctFlash  { animation: correctFlash 0.5s ease-out forwards; }
+.animate-wrongShake    { animation: wrongShake 0.5s ease-out; }
+.animate-levelUp       { animation: levelUp 0.6s ease-out; }
+.animate-mascotBounce  { animation: mascotBounce 0.8s ease-in-out infinite; }
+.animate-mascotSad     { animation: mascotSad 1.5s ease-in-out infinite; }

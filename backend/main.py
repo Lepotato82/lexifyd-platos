@@ -10,7 +10,7 @@ from sqlmodel import SQLModel
 
 from database import engine
 from dataset import load_dataset
-from routers import words, game
+from routers import words, game, graph, nlp
 
 
 @asynccontextmanager
@@ -34,6 +34,8 @@ app.add_middleware(
 
 app.include_router(words.router, prefix="/api/words", tags=["words"])
 app.include_router(game.router, prefix="/api/game", tags=["game"])
+app.include_router(graph.router, prefix="/api/words", tags=["graph"])
+app.include_router(nlp.router, prefix="/api/nlp", tags=["nlp"])
 
 
 @app.get("/health")
