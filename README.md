@@ -1,5 +1,7 @@
 # Lexifyd — Tamil polysemy word game
 
+Built for the Lexifyd Polysemy Hackathon. See [`PS01.pdf`](PS01.pdf) for the problem statement this project addresses.
+
 Tamil fill-in-the-blank and meaning questions, a semantic knowledge graph (D3), flashcards, and progress — FastAPI backend + React (Vite) frontend.
 
 **Environment template:** copy [`backend/.env.example`](backend/.env.example) to `backend/.env`.
